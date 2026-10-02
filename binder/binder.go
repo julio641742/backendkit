@@ -9,43 +9,62 @@ import (
 	"github.com/go-playground/validator/v10"
 
 	"github.com/julio641742/backendkit/httperr"
-	"github.com/julio641742/backendkit/internal/httpx"
 )
 
 // maxBodyBytes caps request bodies before they reach the JSON decoder.
 const maxBodyBytes = 1 << 20 // 1 MiB
 
-// Handler receives the fully bound and validated request. A nil result is
-// answered with 204 and anything else with 200 and the result as JSON; wrap it
-// in a Result (see Created) to pick another 2xx status. Returning an error
-// routes it through the same JSON envelope used for binding failures, so
-// handlers never hand-roll error responses.
-//
-// Handlers may set response headers on w before returning a result, such as
-// Location for a Created one; they are sent along with it. Handlers may also
-// write to w themselves, for streaming and the like; once they have, the
-// returned result is ignored.
-type Handler[T any] func(req *T, w http.ResponseWriter, r *http.Request) (any, error)
-
-// Binder holds decoding and validation configuration. It is immutable once
-// NewBinder returns, so one Binder can be shared by every route.
+// Binder holds providers, decoding and validation configuration. It is
+// immutable once NewBinder returns, so one Binder can be shared by every
+// route.
 type Binder struct {
-	validate *validator.Validate
-	onError  func(*http.Request, error) // logError, swapped out by tests
-	mapError func(error) error
+	validate  *validator.Validate
+	providers map[reflect.Type]func(*http.Request) (reflect.Value, error)
+	onError   func(*http.Request, error) // logError, swapped out by tests
+	mapError  func(error) error
 }
 
 // Option configures a Binder at construction.
 type Option func(*Binder)
 
-// WithErrorMapper translates errors returned by handlers before they are
-// answered, so domain errors map to statuses in one place rather than in every
-// handler. Return a *StatusError to pick the response; returning err unchanged
-// (or nil) keeps the default handling, an opaque 500 for anything that is not
-// already a StatusError.
+// Provide registers fn as the source of handler arguments of type T, such as
+// the logged in user. fn runs once per request, only for handlers that take a
+// T, and before the input struct is decoded. An error it returns is answered
+// like a handler error, so return a *StatusError for anything but a 500:
 //
-// Only handler errors go through fn. Binding and validation failures are
-// answered with a 400 (413, 415) before the handler runs and never reach it.
+//	binder.Provide(func(r *http.Request) (*User, error) {
+//		if u := session.From[User](r).GetUser(); u != nil {
+//			return u, nil
+//		}
+//		return nil, binder.Error(http.StatusUnauthorized, "authentication required", nil)
+//	})
+//
+// It panics when T is context.Context, *http.Request or http.ResponseWriter,
+// which Bind fills itself, or fn is nil.
+func Provide[T any](fn func(*http.Request) (T, error)) Option {
+	t := reflect.TypeFor[T]()
+	if reserved(t) {
+		panic(fmt.Sprintf("binder: Provide(%s): Bind fills it already", t))
+	}
+	if fn == nil {
+		panic(fmt.Sprintf("binder: Provide(%s): nil func", t))
+	}
+	return func(b *Binder) {
+		b.providers[t] = func(r *http.Request) (reflect.Value, error) {
+			v, err := fn(r)
+			return reflect.ValueOf(&v).Elem(), err
+		}
+	}
+}
+
+// WithErrorMapper translates errors returned by handlers and providers before
+// they are answered, so domain errors map to statuses in one place rather
+// than in every handler. Return a *StatusError to pick the response;
+// returning err unchanged (or nil) keeps the default handling, an opaque 500
+// for anything that is not already a StatusError.
+//
+// Binding and validation failures are answered with a 400 (413, 415) before
+// the handler runs and never reach fn.
 //
 //	binder.WithErrorMapper(func(err error) error {
 //		if database.IsNotFound(err) {
@@ -78,8 +97,9 @@ func WithValidation(tag string, fn validator.Func) Option {
 // NewBinder builds a Binder.
 func NewBinder(opts ...Option) *Binder {
 	b := &Binder{
-		validate: validator.New(validator.WithRequiredStructEnabled()),
-		onError:  logError,
+		validate:  validator.New(validator.WithRequiredStructEnabled()),
+		providers: make(map[reflect.Type]func(*http.Request) (reflect.Value, error)),
+		onError:   logError,
 	}
 	for _, opt := range opts {
 		opt(b)
@@ -101,73 +121,115 @@ func NewBinder(opts ...Option) *Binder {
 	return b
 }
 
-// Bind wraps a typed handler into an http.HandlerFunc, so it registers on an
-// http.ServeMux and composes with standard middleware unchanged.
-func (b *Binder) Bind[T any](h Handler[T]) http.HandlerFunc {
-	if h == nil {
-		panic(fmt.Sprintf("binder: nil handler for %s", reflect.TypeFor[T]()))
-	}
-	p := buildPlan[T]() // once, at registration
+// Bind turns fn into an http.HandlerFunc, so it registers on an
+// http.ServeMux or chi and composes with standard middleware unchanged. fn's
+// arguments are filled by type, in any order, each type at most once:
+//
+//   - context.Context, *http.Request, http.ResponseWriter: the request's own
+//   - a type registered with Provide: what its provider returns
+//   - any other struct: the input struct, decoded from the request
+//
+// fn returns error, answered with 204 when nil, or (T, error), answered with
+// 200 and T as JSON, with 204 for a nil pointer, or with the status a *Result
+// picks (see Created). Returning an error routes it through the same JSON
+// envelope used for binding failures, so handlers never hand-roll error
+// responses.
+//
+// Handlers may set response headers on w before returning, such as Location
+// for a Created result; they are sent along with it. Handlers may also write
+// to w themselves, for streaming and the like; once they have, the returned
+// result is ignored.
+//
+// Bind panics when fn's signature breaks these rules; see the package doc for
+// the input struct's.
+func (b *Binder) Bind(fn any) http.HandlerFunc {
+	p := b.buildPlan(fn) // once, at registration
 
 	return func(w http.ResponseWriter, r *http.Request) {
-		req := new(T)
-		v := reflect.ValueOf(req).Elem()
+		args := make([]reflect.Value, len(p.args))
 
-		var fails []FieldError
-
-		if s := p.sections[kindPath]; s.present {
-			fails = append(fails, decodePath(v.Field(s.index), s.params, r)...)
-		}
-		if s := p.sections[kindQuery]; s.present {
-			fails = append(fails, decodeQuery(v.Field(s.index), s, r)...)
-		}
-		if s := p.sections[kindBody]; s.present {
-			bodyFails, status := decodeBody(v, s, w, r)
-			// 413 and 415 describe the request as a whole; field errors from
-			// the other sections would only distract from them.
-			if status != 0 {
-				httperr.Write(w, status, "", bodyFails...)
+		// Providers first, so a request without a user is a 401 rather
+		// than a 400 for its input.
+		for i, k := range p.args {
+			if k != argProvided {
+				continue
+			}
+			v, err := b.providers[p.types[i]](r)
+			if err != nil {
+				b.fail(w, r, err)
 				return
 			}
-			fails = append(fails, bodyFails...)
+			args[i] = v
 		}
 
-		// Only validate once decoding succeeded; validating half-populated
-		// structs produces errors that contradict the decode errors.
-		if len(fails) == 0 {
-			if err := b.validate.Struct(req); err != nil {
-				ve, ok := errors.AsType[validator.ValidationErrors](err)
-				if !ok { // InvalidValidationError: a bug, not bad input
-					b.internalError(w, r, fmt.Errorf("binder: validating %s: %w", reflect.TypeFor[T](), err))
+		for i, k := range p.args {
+			switch k {
+			case argContext:
+				args[i] = reflect.ValueOf(r.Context())
+			case argRequest:
+				args[i] = reflect.ValueOf(r)
+			case argInput:
+				in, ok := b.decode(p.input, w, r)
+				if !ok {
 					return
 				}
-				fails = append(fails, p.validationErrors(ve)...)
+				args[i] = in
 			}
 		}
 
-		if len(fails) > 0 {
-			httperr.Write(w, http.StatusBadRequest, "request validation failed", fails...)
+		out := p.fn.Call(args)
+		var result any
+		if p.returns {
+			result = out[0].Interface()
+		}
+		if err, _ := out[len(out)-1].Interface().(error); err != nil {
+			b.fail(w, r, err)
 			return
 		}
-
-		tw := &httpx.TrackingWriter{ResponseWriter: w}
-		out, err := h(req, tw, r)
-		if err != nil {
-			if b.mapError != nil {
-				if mapped := b.mapError(err); mapped != nil {
-					err = mapped
-				}
-			}
-			b.handleError(tw, r, err)
-			return
-		}
-		b.writeResult(tw, r, out)
+		b.writeResult(w, r, result)
 	}
 }
 
-// internalError answers a request that failed through no fault of its own
-// with an opaque 500, reporting err to the error handler.
-func (b *Binder) internalError(w http.ResponseWriter, r *http.Request, err error) {
-	b.onError(r, err)
-	httperr.Write(w, http.StatusInternalServerError, "internal server error")
+// decode fills and validates the input struct, answering the request itself
+// and reporting false when that fails.
+func (b *Binder) decode(in *input, w http.ResponseWriter, r *http.Request) (reflect.Value, bool) {
+	v := reflect.New(in.typ).Elem()
+
+	var fails []FieldError
+	fails = append(fails, decodePath(v, in.params, r)...)
+	fails = append(fails, decodeQuery(v, in.params, r)...)
+	if in.body != nil {
+		bodyFails, status := decodeBody(v, in.body, w, r)
+		// 413 and 415 describe the request as a whole; field errors from
+		// the parameters would only distract from them.
+		if status != 0 {
+			httperr.Write(w, status, "", bodyFails...)
+			return v, false
+		}
+		fails = append(fails, bodyFails...)
+	}
+
+	// Only validate once decoding succeeded; validating half-populated
+	// structs produces errors that contradict the decode errors.
+	if len(fails) == 0 {
+		if ve, ok := errors.AsType[validator.ValidationErrors](b.validate.Struct(v.Interface())); ok {
+			fails = append(fails, in.validationErrors(ve)...)
+		}
+	}
+
+	if len(fails) > 0 {
+		httperr.Write(w, http.StatusBadRequest, "request validation failed", fails...)
+		return v, false
+	}
+	return v, true
+}
+
+// fail answers a handler or provider error, after the error mapper.
+func (b *Binder) fail(w http.ResponseWriter, r *http.Request, err error) {
+	if b.mapError != nil {
+		if mapped := b.mapError(err); mapped != nil {
+			err = mapped
+		}
+	}
+	b.handleError(w, r, err)
 }

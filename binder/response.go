@@ -7,8 +7,6 @@ import (
 	"net/http"
 	"reflect"
 	"strconv"
-
-	"github.com/julio641742/backendkit/internal/httpx"
 )
 
 // Result lets a handler choose the success status; return it as a *Result. Status must be a 2xx, or 0
@@ -26,21 +24,10 @@ func Created(body any) *Result { return &Result{Status: http.StatusCreated, Body
 // writeResult sends what the handler returned. The body is marshalled before
 // any header goes out, so an encoding failure still becomes a clean 500 rather
 // than a truncated 2xx.
-func (b *Binder) writeResult(w *httpx.TrackingWriter, r *http.Request, v any) {
-	if w.Started() {
-		// The handler answered on its own; a returned value has nowhere to go.
-		if !isNil(v) {
-			b.onError(r, errors.New("binder: handler returned a result after writing a response"))
-		}
-		return
-	}
-
+func (b *Binder) writeResult(w http.ResponseWriter, r *http.Request, v any) {
 	status, body := 0, v
-	switch res := v.(type) {
-	case *Result:
-		if res != nil {
-			status, body = res.Status, res.Body
-		}
+	if res, ok := v.(*Result); ok && res != nil {
+		status, body = res.Status, res.Body
 	}
 	if status == 0 {
 		status = http.StatusOK

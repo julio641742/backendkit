@@ -15,7 +15,6 @@ import (
 	"github.com/go-playground/validator/v10"
 
 	"github.com/julio641742/backendkit/httperr"
-	"github.com/julio641742/backendkit/internal/httpx"
 )
 
 type FieldError = httperr.FieldError
@@ -67,19 +66,15 @@ func FieldErr(status int, field, msg string) error {
 
 // handleError turns a handler error into the envelope. Errors that are not a
 // StatusError become an opaque 500, so internal details never reach clients.
-func (b *Binder) handleError(w *httpx.TrackingWriter, r *http.Request, err error) {
+func (b *Binder) handleError(w http.ResponseWriter, r *http.Request, err error) {
 	status, msg := http.StatusInternalServerError, "internal server error"
 	var fields []FieldError
 	if se, ok := errors.AsType[*StatusError](err); ok && se.Status >= 400 && se.Status <= 599 {
 		status, msg, fields = se.Status, se.Message, se.Fields
 	}
 
-	if w.Started() || status >= 500 {
+	if status >= 500 {
 		b.onError(r, err)
-	}
-	// Headers are gone; writing the envelope now would corrupt the body.
-	if w.Started() {
-		return
 	}
 	httperr.Write(w, status, msg, fields...)
 }
@@ -99,28 +94,29 @@ func logError(r *http.Request, err error) {
 // Validation errors
 // ---------------------------------------------------------------------------
 
-// validationErrors maps validator's namespaces back onto sections, so a failure
-// in Body.Email is reported with source "body" rather than a bare field name.
-func (p *plan) validationErrors(ve validator.ValidationErrors) []FieldError {
+// validationErrors maps validator's namespaces back onto parameters and the
+// Body, so a failure in Body.Email is reported with source "body" and field
+// "email" rather than a bare field name.
+func (in *input) validationErrors(ve validator.ValidationErrors) []FieldError {
 	out := make([]FieldError, 0, len(ve))
 	for _, fe := range ve {
-		source, field := "request", fe.Field()
-		// StructNamespace looks like "CreateUserReq.Body.Address.Street": the
-		// type, the section field, then the Go path of the failing field,
-		// translated with the section's own tag key. A failure on the
-		// section itself (a required body) leaves field empty.
-		parts := strings.Split(fe.StructNamespace(), ".")
-		if len(parts) > 1 {
-			if k, ok := p.byName[parts[1]]; ok {
-				source = k.String()
-				field = wirePath(p.sections[k].typ, k.tagKey(), parts[2:])
+		// StructNamespace looks like "updateInput.Body.Address.Street": the
+		// type, when it has a name, then the Go path of the failing field.
+		goPath := fe.StructNamespace()
+		if name := in.typ.Name(); name != "" {
+			goPath = strings.TrimPrefix(goPath, name+".")
+		}
+		e := FieldError{Source: "request", Field: fe.Field(), Message: defaultMessage(fe)}
+		if p, ok := in.byPath[goPath]; ok {
+			e.Source, e.Field = p.source, p.name
+		} else if rest, ok := strings.CutPrefix(goPath, "Body"); ok && in.body != nil && (rest == "" || rest[0] == '.') {
+			// A failure on the Body itself (a required body) leaves Field empty.
+			e.Source, e.Field = "body", ""
+			if rest != "" {
+				e.Field = wirePath(in.body.typ, "json", strings.Split(rest[1:], "."))
 			}
 		}
-		out = append(out, FieldError{
-			Source:  source,
-			Field:   field,
-			Message: defaultMessage(fe),
-		})
+		out = append(out, e)
 	}
 	return out
 }

@@ -1,184 +1,224 @@
 package binder
 
 import (
+	"context"
 	"encoding"
 	"fmt"
+	"net/http"
 	"reflect"
 	"slices"
 	"strings"
 )
 
-type kind uint8
+// argKind says where Bind finds a handler argument.
+type argKind uint8
 
 const (
-	kindPath kind = iota
-	kindQuery
-	kindBody
-	numKinds
+	argContext argKind = iota
+	argRequest
+	argProvided
+	argInput
 )
 
-// kinds holds each source's name, which is also its `bind` tag value, and
-// the tag key its fields are named with.
-var kinds = [numKinds]struct{ name, tagKey string }{
-	kindPath:  {"path", "path"},
-	kindQuery: {"query", "query"},
-	kindBody:  {"body", "json"},
+var (
+	contextType = reflect.TypeFor[context.Context]()
+	requestType = reflect.TypeFor[*http.Request]()
+	errorType   = reflect.TypeFor[error]()
+)
+
+// reserved reports the types Bind fills itself, which Provide refuses.
+func reserved(t reflect.Type) bool {
+	return t == contextType || t == requestType
 }
 
-func (k kind) String() string { return kinds[k].name }
-func (k kind) tagKey() string { return kinds[k].tagKey }
-
-// kindOf returns the kind a `bind` tag names.
-func kindOf(tag string) (kind, bool) {
-	for k := range numKinds {
-		if kinds[k].name == tag {
-			return k, true
-		}
-	}
-	return 0, false
+// plan is what Bind learns from a handler's signature.
+type plan struct {
+	fn      reflect.Value
+	args    []argKind
+	types   []reflect.Type
+	input   *input // nil when the handler takes no input struct
+	returns bool   // the handler returns (T, error) rather than error
 }
 
-type section struct {
-	present bool
-	ptr     bool         // declared as *struct: optional, left nil when absent
-	index   int          // field index within the request struct
-	typ     reflect.Type // the section's struct type, pointer stripped
-	params  []param      // path and query only: the fields to fill
+// input describes the input struct: its path and query fields and its Body.
+type input struct {
+	typ    reflect.Type
+	params []param
+	body   *body
+	byPath map[string]param // Go field path ("Page.Limit") -> param, for error attribution
 }
 
 // param is a path or query field: a scalar, a pointer to one or, in the
 // query, a slice of them. Scalars are strings, bools, numbers and types
 // implementing encoding.TextUnmarshaler, such as uuid.UUID and time.Time.
 type param struct {
-	name  string // the wildcard or query parameter name
-	index []int  // for reflect.Value.FieldByIndex on the section
+	source string // "path" or "query"
+	name   string // the wildcard or query parameter name
+	index  []int  // for reflect.Value.FieldByIndex on the input struct
 }
 
-type plan struct {
-	sections [numKinds]section
-	byName   map[string]kind // field name -> kind, for error attribution
+type body struct {
+	index int          // field index within the input struct
+	typ   reflect.Type // pointer stripped
 }
 
-// buildPlan reflects over T once and panics on anything malformed. Panicking is
-// deliberate: these are programmer errors in route definitions, and a process
-// that refuses to start beats one that 400s every request to one endpoint.
-func buildPlan[T any]() *plan {
-	t := reflect.TypeFor[T]()
-	if t.Kind() != reflect.Struct {
-		panic(fmt.Sprintf("binder: %s is not a struct", t))
+// buildPlan reflects over fn once and panics on anything malformed. Panicking
+// is deliberate: these are programmer errors in route definitions, and a
+// process that refuses to start beats one that 400s every request to one
+// endpoint.
+func (b *Binder) buildPlan(fn any) *plan {
+	v := reflect.ValueOf(fn)
+	if fn == nil || v.Kind() != reflect.Func || v.IsNil() {
+		panic(fmt.Sprintf("binder: handler must be a non-nil func, got %T", fn))
+	}
+	t := v.Type()
+	if t.IsVariadic() {
+		panic(fmt.Sprintf("binder: handler %s must not be variadic", t))
 	}
 
-	p := &plan{byName: make(map[string]kind)}
+	p := &plan{fn: v}
+	seen := make(map[reflect.Type]bool)
+	for at := range t.Ins() {
+		if seen[at] {
+			panic(fmt.Sprintf("binder: handler %s takes %s twice", t, at))
+		}
+		seen[at] = true
 
-	for i := range t.NumField() {
-		f := t.Field(i)
-
-		tag, ok := f.Tag.Lookup("bind")
-		if !ok {
-			panic(fmt.Sprintf("binder: %s.%s has no `bind` tag; every field of a "+
-				"request struct must declare its source", t, f.Name))
+		var k argKind
+		switch _, provided := b.providers[at]; {
+		case at == contextType:
+			k = argContext
+		case at == requestType:
+			k = argRequest
+		case provided:
+			k = argProvided
+		case at.Kind() == reflect.Struct:
+			if p.input != nil {
+				panic(fmt.Sprintf("binder: handler %s takes two input structs, %s and %s", t, p.input.typ, at))
+			}
+			k, p.input = argInput, buildInput(at)
+		default:
+			panic(fmt.Sprintf("binder: handler %s takes %s, which is neither built in, provided nor an input struct", t, at))
 		}
-		k, ok := kindOf(tag)
-		if !ok {
-			panic(fmt.Sprintf("binder: %s.%s has unknown bind source %q", t, f.Name, tag))
-		}
-		if p.sections[k].present {
-			panic(fmt.Sprintf("binder: %s declares two %q sections", t, k))
-		}
-		if !f.IsExported() {
-			panic(fmt.Sprintf("binder: %s.%s is unexported and cannot be bound", t, f.Name))
-		}
-
-		ft, isPtr := f.Type, false
-		if ft.Kind() == reflect.Pointer {
-			ft, isPtr = ft.Elem(), true
-		}
-		if ft.Kind() != reflect.Struct {
-			panic(fmt.Sprintf("binder: %s.%s must be a struct or *struct, got %s",
-				t, f.Name, f.Type))
-		}
-		if isPtr && k != kindBody {
-			panic(fmt.Sprintf("binder: %s.%s: only the body section may be optional", t, f.Name))
-		}
-
-		sec := section{present: true, ptr: isPtr, index: i, typ: ft}
-		if k == kindBody {
-			checkSectionTags(t, f.Name, ft, k)
-		} else {
-			sec.params = params(t, f.Name, ft, k, nil)
-		}
-
-		p.sections[k] = sec
-		p.byName[f.Name] = k
+		p.args = append(p.args, k)
+		p.types = append(p.types, at)
 	}
 
+	switch {
+	case t.NumOut() == 1 && t.Out(0) == errorType:
+	case t.NumOut() == 2 && t.Out(1) == errorType:
+		p.returns = true
+	default:
+		panic(fmt.Sprintf("binder: handler %s must return error or (T, error)", t))
+	}
 	return p
 }
 
-// checkSectionTags rejects a section whose fields carry the wrong tag key for
-// their source — the swapped-tag mistake that otherwise fails silently.
-func checkSectionTags(outer reflect.Type, fieldName string, sec reflect.Type, k kind) {
-	want := k.tagKey()
-	for f := range sec.Fields() {
-		// Embedded structs are flattened, so their fields belong to the section.
-		if f.Anonymous && f.Type.Kind() == reflect.Struct {
-			checkSectionTags(outer, fieldName, f.Type, k)
-			continue
-		}
-		if !f.IsExported() || f.Anonymous {
-			continue
-		}
-		if _, ok := f.Tag.Lookup(want); !ok {
-			panic(fmt.Sprintf("binder: %s.%s.%s is in the %q section but has no `%s` tag",
-				outer, fieldName, f.Name, k, want))
-		}
+// buildInput lists the fields of an input struct, flattening embedded structs
+// as encoding/json does, and panics on a field that is neither a tagged
+// parameter nor the Body.
+func buildInput(t reflect.Type) *input {
+	in := &input{typ: t, byPath: make(map[string]param)}
+	in.params = params(in, t, nil, nil)
+	if len(in.params) == 0 && in.body == nil {
+		panic(fmt.Sprintf("binder: input struct %s has no path or query fields and no Body", t))
 	}
+	seen := make(map[[2]string]bool)
+	for _, p := range in.params {
+		k := [2]string{p.source, p.name}
+		if seen[k] {
+			panic(fmt.Sprintf("binder: %s has two fields for the %s parameter %q", t, p.source, p.name))
+		}
+		seen[k] = true
+	}
+	return in
 }
 
-// params lists the fields of a path or query section, flattening embedded
-// structs as encoding/json does, and panics on a field that has no name in
-// its tag or a type that can't be decoded from a string.
-func params(outer reflect.Type, fieldName string, sec reflect.Type, k kind, index []int) []param {
+func params(in *input, t reflect.Type, index []int, goPath []string) []param {
 	var out []param
-	for f := range sec.Fields() {
+	for f := range t.Fields() {
 		idx := append(slices.Clone(index), f.Index...)
+		path := append(slices.Clone(goPath), f.Name)
 		if f.Anonymous && f.Type.Kind() == reflect.Struct {
-			out = append(out, params(outer, fieldName, f.Type, k, idx)...)
+			out = append(out, params(in, f.Type, idx, path)...)
 			continue
 		}
 		if !f.IsExported() {
+			if _, ok := f.Tag.Lookup("path"); ok {
+				panic(fmt.Sprintf("binder: %s.%s is unexported, so its `path` tag is ignored", in.typ, f.Name))
+			}
+			if _, ok := f.Tag.Lookup("query"); ok {
+				panic(fmt.Sprintf("binder: %s.%s is unexported, so its `query` tag is ignored", in.typ, f.Name))
+			}
+			continue
+		}
+		if f.Name == "Body" && len(index) == 0 {
+			in.body = buildBody(in.typ, f)
 			continue
 		}
 
-		key := k.tagKey()
-		tag, ok := f.Tag.Lookup(key)
-		if !ok {
-			panic(fmt.Sprintf("binder: %s.%s.%s is in the %q section but has no `%s` tag",
-				outer, fieldName, f.Name, k, key))
+		source, tag := "path", ""
+		pathTag, isPath := f.Tag.Lookup("path")
+		queryTag, isQuery := f.Tag.Lookup("query")
+		switch {
+		case isPath && isQuery:
+			panic(fmt.Sprintf("binder: %s.%s has both a `path` and a `query` tag", in.typ, f.Name))
+		case isPath:
+			tag = pathTag
+		case isQuery:
+			source, tag = "query", queryTag
+		default:
+			panic(fmt.Sprintf("binder: %s.%s has no `path` or `query` tag; every field of an "+
+				"input struct must declare its source, or be the Body", in.typ, f.Name))
 		}
 		if tag == "-" {
 			continue
 		}
 		if tag == "" || strings.Contains(tag, ",") {
-			panic(fmt.Sprintf("binder: %s.%s.%s: the `%s` tag must be just a name; use `binding` for rules such as required",
-				outer, fieldName, f.Name, key))
+			panic(fmt.Sprintf("binder: %s.%s: the `%s` tag must be just a name; use `binding` for rules such as required",
+				in.typ, f.Name, source))
 		}
-		if !isParamType(f.Type, k == kindQuery) {
-			panic(fmt.Sprintf("binder: %s.%s.%s: %s can't be decoded from a %s parameter",
-				outer, fieldName, f.Name, f.Type, k))
+		if !isParamType(f.Type) {
+			panic(fmt.Sprintf("binder: %s.%s: %s can't be decoded from a %s parameter",
+				in.typ, f.Name, f.Type, source))
 		}
-		out = append(out, param{name: tag, index: idx})
+		p := param{source: source, name: tag, index: idx}
+		in.byPath[strings.Join(path, ".")] = p
+		out = append(out, p)
 	}
 	return out
+}
+
+func buildBody(outer reflect.Type, f reflect.StructField) *body {
+	if f.Type.Kind() != reflect.Struct {
+		panic(fmt.Sprintf("binder: %s.Body is a %s; it must be a struct", outer, f.Type))
+	}
+	checkBodyTags(outer, f.Type)
+	return &body{index: f.Index[0], typ: f.Type}
+}
+
+// checkBodyTags rejects body fields tagged as path or query parameters but
+// not json — the swapped-tag mistake that otherwise fails silently.
+func checkBodyTags(outer, t reflect.Type) {
+	for f := range t.Fields() {
+		if f.Anonymous && f.Type.Kind() == reflect.Struct {
+			checkBodyTags(outer, f.Type)
+			continue
+		}
+		_, isJSON := f.Tag.Lookup("json")
+		_, isPath := f.Tag.Lookup("path")
+		_, isQuery := f.Tag.Lookup("query")
+		if f.IsExported() && !isJSON && (isPath || isQuery) {
+			panic(fmt.Sprintf("binder: %s.Body.%s has a `path` or `query` tag but no `json` tag; "+
+				"move it out of the Body", outer, f.Name))
+		}
+	}
 }
 
 var textUnmarshaler = reflect.TypeFor[encoding.TextUnmarshaler]()
 
 // isParamType reports whether setParam can fill a field of type t.
-func isParamType(t reflect.Type, allowSlice bool) bool {
-	if allowSlice && t.Kind() == reflect.Slice {
-		return isParamType(t.Elem(), false)
-	}
+func isParamType(t reflect.Type) bool {
 	if t.Kind() == reflect.Pointer {
 		t = t.Elem()
 	}
@@ -196,7 +236,7 @@ func isParamType(t reflect.Type, allowSlice bool) bool {
 }
 
 // tagName returns the wire name a struct tag assigns, or "" when the tag is
-// absent, unnamed ("path:\",required\"") or skipped ("-").
+// absent, unnamed ("json:\",omitempty\"") or skipped ("-").
 func tagName(f reflect.StructField, key string) string {
 	name, _, _ := strings.Cut(f.Tag.Get(key), ",")
 	if name == "-" {

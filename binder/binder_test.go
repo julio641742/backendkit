@@ -1,6 +1,7 @@
 package binder_test
 
 import (
+	"context"
 	"encoding/json/v2"
 	"errors"
 	"fmt"
@@ -62,63 +63,45 @@ func wantErrors(t *testing.T, res result, want ...binder.FieldError) {
 	}
 }
 
-func noop[T any](*T, http.ResponseWriter, *http.Request) (any, error) { return nil, nil }
+func noop[T any](T) error { return nil }
 
 var defaultBinder = binder.NewBinder()
 
 // ---------------------------------------------------------------------------
-// Request types
+// Input types
 // ---------------------------------------------------------------------------
 
-type CreateUserReq struct {
-	Path struct {
-		OrgID int `path:"org_id" binding:"required,min=1"`
-	} `bind:"path"`
-	Query struct {
-		Notify bool `query:"notify"`
-	} `bind:"query"`
-	Body *struct {
+type CreateUserInput struct {
+	OrgID  int  `path:"org_id" binding:"required,min=1"`
+	Notify bool `query:"notify"`
+	Body   struct {
 		Name  string `json:"name"  binding:"required"`
 		Email string `json:"email" binding:"required,email"`
-	} `bind:"body"`
+	}
 }
 
 type OrgOnly struct {
-	Path struct {
-		OrgID int `path:"org_id" binding:"required"`
-	} `bind:"path"`
+	OrgID int `path:"org_id" binding:"required"`
 }
 
 type NamePath struct {
-	Path struct {
-		Name string `path:"name"`
-	} `bind:"path"`
-}
-
-type OptionalBody struct {
-	Body *struct {
-		Name string `json:"name" binding:"required"`
-	} `bind:"body"`
+	Name string `path:"name"`
 }
 
 type RequiredBody struct {
 	Body struct {
 		Name string `json:"name" binding:"required"`
-	} `bind:"body"`
+	}
 }
 
 type ThreeInts struct {
-	Query struct {
-		A int `query:"a"`
-		B int `query:"b"`
-		C int `query:"c"`
-	} `bind:"query"`
+	A int `query:"a"`
+	B int `query:"b"`
+	C int `query:"c"`
 }
 
 type QueryRequired struct {
-	Query struct {
-		Q string `query:"q" binding:"required"`
-	} `bind:"query"`
+	Q string `query:"q" binding:"required"`
 }
 
 type Nested struct {
@@ -126,7 +109,7 @@ type Nested struct {
 		Address struct {
 			Street string `json:"street" binding:"required"`
 		} `json:"address"`
-	} `bind:"body"`
+	}
 }
 
 type Typed struct {
@@ -134,7 +117,7 @@ type Typed struct {
 		Age   int      `json:"age"`
 		Tags  []string `json:"tags"`
 		Score float64  `json:"score"`
-	} `bind:"body"`
+	}
 }
 
 type Sizes struct {
@@ -142,30 +125,30 @@ type Sizes struct {
 		Name  string   `json:"name"  binding:"min=3"`
 		Tags  []string `json:"tags"  binding:"max=1"`
 		Count int      `json:"count" binding:"min=10"`
-	} `bind:"body"`
+	}
 }
 
 type Custom struct {
 	Body struct {
 		Code string `json:"code" binding:"is_upper"`
-	} `bind:"body"`
+	}
 }
 
 // ---------------------------------------------------------------------------
 // Happy path
 // ---------------------------------------------------------------------------
 
-func TestBindAllSections(t *testing.T) {
-	var got *CreateUserReq
+func TestBindAllSources(t *testing.T) {
+	var got CreateUserInput
 	r := http.NewServeMux()
-	r.HandleFunc("POST /orgs/{org_id}/users", defaultBinder.Bind(func(req *CreateUserReq, _ http.ResponseWriter, _ *http.Request) (any, error) {
-		got = req
+	r.HandleFunc("POST /orgs/{org_id}/users", defaultBinder.Bind(func(in CreateUserInput) (*binder.Result, error) {
+		got = in
 		return binder.Created(map[string]int{"id": 1}), nil
 	}))
 
 	res := serve(t, r, jsonReq("POST", "/orgs/7/users?notify=true", `{"name":"Ada","email":"ada@example.com"}`))
 	wantStatus(t, res, http.StatusCreated)
-	if got.Path.OrgID != 7 || !got.Query.Notify || got.Body == nil || got.Body.Name != "Ada" {
+	if got.OrgID != 7 || !got.Notify || got.Body.Name != "Ada" {
 		t.Fatalf("bound request = %+v", got)
 	}
 	if res.raw != `{"id":1}` {
@@ -203,7 +186,7 @@ func TestHandlerResult(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			r := http.NewServeMux()
-			r.HandleFunc("GET /", defaultBinder.Bind(func(*OptionalBody, http.ResponseWriter, *http.Request) (any, error) {
+			r.HandleFunc("GET /", defaultBinder.Bind(func() (any, error) {
 				return tt.result, nil
 			}))
 
@@ -242,7 +225,7 @@ func TestHandlerResultFailures(t *testing.T) {
 				binder.WithErrorHandler(func(_ *http.Request, err error) { reported = err }),
 			)
 			r := http.NewServeMux()
-			r.HandleFunc("GET /", b.Bind(func(*OptionalBody, http.ResponseWriter, *http.Request) (any, error) {
+			r.HandleFunc("GET /", b.Bind(func() (any, error) {
 				return tt.result, nil
 			}))
 
@@ -258,26 +241,6 @@ func TestHandlerResultFailures(t *testing.T) {
 	}
 }
 
-func TestHandlerResultAfterResponseStarted(t *testing.T) {
-	var reported error
-	b := binder.NewBinder(binder.WithErrorHandler(func(_ *http.Request, err error) { reported = err }))
-	r := http.NewServeMux()
-	r.HandleFunc("GET /", b.Bind(func(_ *OptionalBody, w http.ResponseWriter, _ *http.Request) (any, error) {
-		w.WriteHeader(http.StatusAccepted)
-		_, _ = w.Write([]byte("streamed"))
-		return user{ID: 1}, nil
-	}))
-
-	res := serve(t, r, httptest.NewRequest("GET", "/", nil))
-	wantStatus(t, res, http.StatusAccepted)
-	if res.raw != "streamed" {
-		t.Fatalf("body = %q, want the handler's body untouched", res.raw)
-	}
-	if reported == nil {
-		t.Fatal("dropped result was not reported")
-	}
-}
-
 // ---------------------------------------------------------------------------
 // Bug 1: parameters from parent routes must not fail binding
 // ---------------------------------------------------------------------------
@@ -285,9 +248,9 @@ func TestHandlerResultAfterResponseStarted(t *testing.T) {
 func TestPathIgnoresUndeclaredParams(t *testing.T) {
 	var got int
 	r := http.NewServeMux()
-	r.HandleFunc("GET /orgs/{org_id}/users/{user_id}", defaultBinder.Bind(func(req *OrgOnly, _ http.ResponseWriter, _ *http.Request) (any, error) {
-		got = req.Path.OrgID
-		return nil, nil
+	r.HandleFunc("GET /orgs/{org_id}/users/{user_id}", defaultBinder.Bind(func(in OrgOnly) error {
+		got = in.OrgID
+		return nil
 	}))
 
 	res := serve(t, r, httptest.NewRequest("GET", "/orgs/1/users/2", nil))
@@ -315,9 +278,9 @@ func TestPathUnescape(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			var got string
 			r := http.NewServeMux()
-			r.HandleFunc("GET /u/{name}", defaultBinder.Bind(func(req *NamePath, _ http.ResponseWriter, _ *http.Request) (any, error) {
-				got = req.Path.Name
-				return nil, nil
+			r.HandleFunc("GET /u/{name}", defaultBinder.Bind(func(in NamePath) error {
+				got = in.Name
+				return nil
 			}))
 
 			res := serve(t, r, httptest.NewRequest("GET", tt.target, nil))
@@ -345,43 +308,6 @@ func TestStrictQuery(t *testing.T) {
 // Bug 4: body emptiness does not depend on Content-Length
 // ---------------------------------------------------------------------------
 
-func TestOptionalBodyAbsent(t *testing.T) {
-	tests := []struct {
-		name          string
-		body          string
-		contentLength int64
-	}{
-		{"known empty", "", 0},
-		{"chunked empty", "", -1},
-		{"whitespace only", "  \n", -1},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			called := false
-			r := http.NewServeMux()
-			r.HandleFunc("POST /", defaultBinder.Bind(func(req *OptionalBody, _ http.ResponseWriter, _ *http.Request) (any, error) {
-				called = true
-				if req.Body != nil {
-					t.Errorf("Body = %+v, want nil", req.Body)
-				}
-				return nil, nil
-			}))
-
-			// io.NopCloser hides the length from httptest, like a chunked upload.
-			req := httptest.NewRequest("POST", "/", io.NopCloser(strings.NewReader(tt.body)))
-			req.ContentLength = tt.contentLength
-			if tt.body != "" {
-				req.Header.Set("Content-Type", "application/json")
-			}
-
-			wantStatus(t, serve(t, r, req), http.StatusNoContent)
-			if !called {
-				t.Fatal("handler not called")
-			}
-		})
-	}
-}
-
 func TestRequiredBodyEmpty(t *testing.T) {
 	r := http.NewServeMux()
 	r.HandleFunc("POST /", defaultBinder.Bind(noop[RequiredBody]))
@@ -399,7 +325,7 @@ func TestRequiredBodyEmpty(t *testing.T) {
 
 func TestStrictBodyUnknownField(t *testing.T) {
 	r := http.NewServeMux()
-	r.HandleFunc("POST /", binder.NewBinder().Bind(noop[OptionalBody]))
+	r.HandleFunc("POST /", binder.NewBinder().Bind(noop[RequiredBody]))
 
 	res := serve(t, r, jsonReq("POST", "/", `{"name":"x","nmae":"y"}`))
 	wantStatus(t, res, http.StatusBadRequest)
@@ -432,49 +358,6 @@ func TestQueryErrorsSorted(t *testing.T) {
 // Bug 7: handler errors after the response started, and 5xx reporting
 // ---------------------------------------------------------------------------
 
-func TestHandlerErrorAfterResponseStarted(t *testing.T) {
-	var reported error
-	b := binder.NewBinder(binder.WithErrorHandler(func(_ *http.Request, err error) { reported = err }))
-
-	boom := errors.New("boom")
-	r := http.NewServeMux()
-	r.HandleFunc("POST /", b.Bind(func(_ *OptionalBody, w http.ResponseWriter, _ *http.Request) (any, error) {
-		w.WriteHeader(http.StatusCreated)
-		_, _ = w.Write([]byte(`{"id":1}`))
-		return nil, boom
-	}))
-
-	res := serve(t, r, httptest.NewRequest("POST", "/", nil))
-	wantStatus(t, res, http.StatusCreated)
-	if res.raw != `{"id":1}` {
-		t.Fatalf("body = %q, want the handler's body untouched", res.raw)
-	}
-	if !errors.Is(reported, boom) {
-		t.Fatalf("reported = %v, want %v", reported, boom)
-	}
-}
-
-func TestHandlerErrorAfterSwitchingProtocols(t *testing.T) {
-	var reported error
-	b := binder.NewBinder(binder.WithErrorHandler(func(_ *http.Request, err error) { reported = err }))
-
-	boom := errors.New("boom")
-	r := http.NewServeMux()
-	r.HandleFunc("POST /", b.Bind(func(_ *OptionalBody, w http.ResponseWriter, _ *http.Request) (any, error) {
-		w.WriteHeader(http.StatusSwitchingProtocols)
-		return nil, boom
-	}))
-
-	res := serve(t, r, httptest.NewRequest("POST", "/", nil))
-	wantStatus(t, res, http.StatusSwitchingProtocols)
-	if res.raw != "" {
-		t.Fatalf("body = %q, want no error envelope after 101", res.raw)
-	}
-	if !errors.Is(reported, boom) {
-		t.Fatalf("reported = %v, want %v", reported, boom)
-	}
-}
-
 func TestHandlerErrorReporting(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -493,7 +376,7 @@ func TestHandlerErrorReporting(t *testing.T) {
 				binder.WithErrorHandler(func(_ *http.Request, err error) { reported = err }),
 			)
 			r := http.NewServeMux()
-			r.HandleFunc("POST /", b.Bind(func(*OptionalBody, http.ResponseWriter, *http.Request) (any, error) { return nil, tt.err }))
+			r.HandleFunc("POST /", b.Bind(func() error { return tt.err }))
 
 			res := serve(t, r, httptest.NewRequest("POST", "/", nil))
 			wantStatus(t, res, tt.wantStatus)
@@ -521,7 +404,7 @@ func TestStatusErrorEdgeCases(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			b := binder.NewBinder(binder.WithErrorHandler(nil))
 			r := http.NewServeMux()
-			r.HandleFunc("POST /", b.Bind(func(*OptionalBody, http.ResponseWriter, *http.Request) (any, error) { return nil, tt.err }))
+			r.HandleFunc("POST /", b.Bind(func() error { return tt.err }))
 
 			res := serve(t, r, httptest.NewRequest("POST", "/", nil))
 			wantStatus(t, res, tt.wantStatus)
@@ -546,9 +429,7 @@ func TestErrorConstructor(t *testing.T) {
 	}
 
 	r := http.NewServeMux()
-	r.HandleFunc("GET /", binder.NewBinder(binder.WithErrorHandler(nil)).Bind(func(*OptionalBody, http.ResponseWriter, *http.Request) (any, error) {
-		return nil, err
-	}))
+	r.HandleFunc("GET /", binder.NewBinder(binder.WithErrorHandler(nil)).Bind(func() error { return err }))
 	res := serve(t, r, httptest.NewRequest("GET", "/", nil))
 	wantStatus(t, res, http.StatusNotFound)
 	if res.body.Error != "no user" {
@@ -559,9 +440,7 @@ func TestErrorConstructor(t *testing.T) {
 func TestFieldErr(t *testing.T) {
 	serveErr := func(err error) result {
 		r := http.NewServeMux()
-		r.HandleFunc("POST /", binder.NewBinder(binder.WithErrorHandler(nil)).Bind(func(*OptionalBody, http.ResponseWriter, *http.Request) (any, error) {
-			return nil, err
-		}))
+		r.HandleFunc("POST /", binder.NewBinder(binder.WithErrorHandler(nil)).Bind(func() error { return err }))
 		return serve(t, r, httptest.NewRequest("POST", "/", nil))
 	}
 
@@ -602,64 +481,41 @@ func TestErrorEnvelopeHeaders(t *testing.T) {
 	}
 }
 
-func TestHijackPassesThrough(t *testing.T) {
-	r := http.NewServeMux()
-	r.HandleFunc("POST /", defaultBinder.Bind(func(_ *OptionalBody, w http.ResponseWriter, _ *http.Request) (any, error) {
-		// httptest.ResponseRecorder cannot hijack; the error must say so
-		// rather than the call panicking.
-		if _, _, err := http.NewResponseController(w).Hijack(); !errors.Is(err, http.ErrNotSupported) {
-			t.Fatalf("Hijack err = %v, want http.ErrNotSupported", err)
-		}
-		return nil, nil
-	}))
-	wantStatus(t, serve(t, r, httptest.NewRequest("POST", "/", nil)), http.StatusNoContent)
-}
-
-func TestFlushPassesThrough(t *testing.T) {
-	r := http.NewServeMux()
-	r.HandleFunc("POST /", defaultBinder.Bind(func(_ *OptionalBody, w http.ResponseWriter, _ *http.Request) (any, error) {
-		f, ok := w.(http.Flusher)
-		if !ok {
-			t.Fatal("wrapped writer lost http.Flusher")
-		}
-		f.Flush()
-		return nil, nil
-	}))
-
-	rec := httptest.NewRecorder()
-	r.ServeHTTP(rec, httptest.NewRequest("POST", "/", nil))
-	if !rec.Flushed {
-		t.Fatal("Flush did not reach the underlying writer")
-	}
-}
-
 // ---------------------------------------------------------------------------
 // Suggestion 1: oversize bodies are a 413
 // ---------------------------------------------------------------------------
 
 func TestMaxBodyBytes(t *testing.T) {
 	r := http.NewServeMux()
-	r.HandleFunc("POST /", defaultBinder.Bind(noop[OptionalBody]))
+	r.HandleFunc("POST /", defaultBinder.Bind(noop[RequiredBody]))
 
 	res := serve(t, r, jsonReq("POST", "/", `{"name":"`+strings.Repeat("x", 1<<20)+`"}`))
 	wantStatus(t, res, http.StatusRequestEntityTooLarge)
 	wantErrors(t, res, binder.FieldError{Source: "body", Message: "request body too large"})
 }
 
+func TestMaxBodyBytesClosesConnection(t *testing.T) {
+	srv := httptest.NewServer(defaultBinder.Bind(noop[RequiredBody]))
+	defer srv.Close()
+
+	body := `{"name":"` + strings.Repeat("x", 1<<20) + `"}`
+	res, err := http.Post(srv.URL, "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = res.Body.Close()
+	if res.StatusCode != http.StatusRequestEntityTooLarge || !res.Close {
+		t.Fatalf("status = %d, Connection: close = %v; want 413 and close", res.StatusCode, res.Close)
+	}
+}
+
 func TestMaxBodyBytesTrailingData(t *testing.T) {
 	// The value itself fits; the limit trips while checking for trailing data.
 	r := http.NewServeMux()
-	r.HandleFunc("POST /", defaultBinder.Bind(noop[OptionalBody]))
+	r.HandleFunc("POST /", defaultBinder.Bind(noop[RequiredBody]))
 
 	res := serve(t, r, jsonReq("POST", "/", `{"name":"x"}`+strings.Repeat(" ", 1<<20)+`{}`))
 	wantStatus(t, res, http.StatusRequestEntityTooLarge)
-}
-
-func TestNilRequestBody(t *testing.T) {
-	h := defaultBinder.Bind(noop[OptionalBody])
-	req := httptest.NewRequest("POST", "/", nil)
-	req.Body = nil
-	wantStatus(t, serve(t, h, req), http.StatusNoContent)
 }
 
 // ---------------------------------------------------------------------------
@@ -698,15 +554,6 @@ func TestWithValidationPanics(t *testing.T) {
 	}
 }
 
-func TestBinderIsStrict(t *testing.T) {
-	r := http.NewServeMux()
-	r.HandleFunc("GET /", defaultBinder.Bind(noop[ThreeInts]))
-	wantStatus(t, serve(t, r, httptest.NewRequest("GET", "/?utm_source=x", nil)), http.StatusBadRequest)
-
-	r.HandleFunc("POST /", defaultBinder.Bind(noop[OptionalBody]))
-	wantStatus(t, serve(t, r, jsonReq("POST", "/", `{"name":"a","extra":1}`)), http.StatusBadRequest)
-}
-
 // ---------------------------------------------------------------------------
 // Suggestion 3: nested fields are reported by their full wire path
 // ---------------------------------------------------------------------------
@@ -720,17 +567,15 @@ func TestNestedFieldPath(t *testing.T) {
 	wantErrors(t, res, binder.FieldError{Source: "body", Field: "address.street", Message: "is required"})
 }
 
-// Each section reports names from its own tag key, whatever other tags a
+// Parameters report names from their own tag key, whatever other tags a
 // field carries.
-func TestFieldNamesUseSectionTag(t *testing.T) {
+func TestFieldNamesUseSourceTag(t *testing.T) {
 	type Base struct {
 		Limit int `query:"limit" json:"page_limit" binding:"max=10"`
 	}
 	type req struct {
-		Query struct {
-			Base
-			Sort string `query:"sort" json:"order" binding:"required"`
-		} `bind:"query"`
+		Base
+		Sort string `query:"sort" json:"order" binding:"required"`
 	}
 	r := http.NewServeMux()
 	r.HandleFunc("GET /", defaultBinder.Bind(noop[req]))
@@ -752,7 +597,7 @@ func TestFieldNamesInsideCollections(t *testing.T) {
 			Items []*Item         `json:"items" binding:"dive"`
 			ByKey map[string]Item `json:"by_key" binding:"dive"`
 			Grid  [][]Item        `json:"grid" binding:"dive,dive"`
-		} `bind:"body"`
+		}
 	}
 	r := http.NewServeMux()
 	r.HandleFunc("POST /", defaultBinder.Bind(noop[req]))
@@ -786,7 +631,7 @@ func TestContentType(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			r := http.NewServeMux()
-			r.HandleFunc("POST /", defaultBinder.Bind(noop[OptionalBody]))
+			r.HandleFunc("POST /", defaultBinder.Bind(noop[RequiredBody]))
 
 			req := httptest.NewRequest("POST", "/", strings.NewReader(`{"name":"x"}`))
 			if tt.contentType != "" {
@@ -854,45 +699,38 @@ type Page struct {
 }
 
 type Params struct {
-	Path struct {
-		ID uuid.UUID `path:"id"`
-	} `bind:"path"`
-	Query struct {
-		Page
-		Since  time.Time `query:"since"`
-		Active *bool     `query:"active"`
-		Min    uint8     `query:"min"`
-		Ratio  float32   `query:"ratio"`
-		Tags   []string  `query:"tag"`
-		IDs    []int64   `query:"id"`
-		Skip   string    `query:"-"`
-	} `bind:"query"`
+	ID uuid.UUID `path:"id"`
+	Page
+	Since  time.Time `query:"since"`
+	Active *bool     `query:"active"`
+	Min    uint8     `query:"min"`
+	Ratio  float32   `query:"ratio"`
+	Skip   string    `query:"-"`
 }
 
 func TestParamTypes(t *testing.T) {
-	var got *Params
+	var got Params
 	r := http.NewServeMux()
-	r.HandleFunc("GET /items/{id}", defaultBinder.Bind(func(req *Params, _ http.ResponseWriter, _ *http.Request) (any, error) {
-		got = req
-		return nil, nil
+	r.HandleFunc("GET /items/{id}", defaultBinder.Bind(func(in Params) error {
+		got = in
+		return nil
 	}))
 
 	id := uuid.MustParse("019cfa3a-f6a2-7eba-b1da-c7f1bac023f5")
 	res := serve(t, r, httptest.NewRequest("GET", "/items/"+id.String()+
-		"?limit=5&since=2026-01-02T03:04:05Z&active=false&min=7&ratio=0.5&tag=a&tag=b&id=1&id=2", nil))
+		"?limit=5&since=2026-01-02T03:04:05Z&active=false&min=7&ratio=0.5", nil))
 	wantStatus(t, res, http.StatusNoContent)
-	q := got.Query
-	if got.Path.ID != id || q.Limit != 5 || !q.Since.Equal(time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)) ||
-		q.Active == nil || *q.Active || q.Min != 7 || q.Ratio != 0.5 ||
-		!reflect.DeepEqual(q.Tags, []string{"a", "b"}) || !reflect.DeepEqual(q.IDs, []int64{1, 2}) {
+	q := got
+	if got.ID != id || q.Limit != 5 || !q.Since.Equal(time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)) ||
+		q.Active == nil || *q.Active || q.Min != 7 || q.Ratio != 0.5 {
 		t.Fatalf("bound = %+v", got)
 	}
 
 	// Absent and empty values leave the field zero.
 	res = serve(t, r, httptest.NewRequest("GET", "/items/"+id.String()+"?limit=&active=", nil))
 	wantStatus(t, res, http.StatusNoContent)
-	if got.Query.Limit != 0 || got.Query.Active != nil || got.Query.Tags != nil {
-		t.Fatalf("bound = %+v", got.Query)
+	if got.Limit != 0 || got.Active != nil {
+		t.Fatalf("bound = %+v", got)
 	}
 }
 
@@ -900,12 +738,11 @@ func TestParamErrors(t *testing.T) {
 	r := http.NewServeMux()
 	r.HandleFunc("GET /items/{id}", defaultBinder.Bind(noop[Params]))
 
-	res := serve(t, r, httptest.NewRequest("GET", "/items/nope?min=256&id=1&id=x&limit=1&limit=2&Skip=x", nil))
+	res := serve(t, r, httptest.NewRequest("GET", "/items/nope?min=256&limit=1&limit=2&Skip=x", nil))
 	wantStatus(t, res, http.StatusBadRequest)
 	wantErrors(t, res,
 		binder.FieldError{Source: "path", Field: "id", Message: "is not a valid value"},
 		binder.FieldError{Source: "query", Field: "Skip", Message: "is not allowed"},
-		binder.FieldError{Source: "query", Field: "id", Message: "is not a valid value"},
 		binder.FieldError{Source: "query", Field: "limit", Message: "must not be repeated"},
 		binder.FieldError{Source: "query", Field: "min", Message: "is not a valid value"},
 	)
@@ -934,83 +771,100 @@ func TestSizeMessages(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Suggestion 8: registration panics carry the package name
+// Registration panics carry the package name
 // ---------------------------------------------------------------------------
 
 func TestPlanPanics(t *testing.T) {
+	type Page struct {
+		Limit int `json:"limit"`
+	}
 	tests := []struct {
 		name string
 		bind func()
 		want string
 	}{
-		{"not a struct", func() { defaultBinder.Bind(noop[int]) },
-			"binder: int is not a struct"},
-		{"missing bind tag", func() {
-			defaultBinder.Bind(noop[struct{ Body struct{} }])
-		}, "has no `bind` tag"},
-		{"unknown source", func() {
+		{"not a func", func() { defaultBinder.Bind(42) }, "handler must be a non-nil func"},
+		{"nil handler", func() { defaultBinder.Bind(nil) }, "handler must be a non-nil func"},
+		{"typed nil handler", func() { defaultBinder.Bind((func() error)(nil)) }, "handler must be a non-nil func"},
+		{"variadic", func() { defaultBinder.Bind(func(...int) error { return nil }) }, "must not be variadic"},
+		{"no result", func() { defaultBinder.Bind(func() {}) }, "must return error or (T, error)"},
+		{"no error result", func() { defaultBinder.Bind(func() int { return 0 }) }, "must return error or (T, error)"},
+		{"unknown argument", func() { defaultBinder.Bind(func(int) error { return nil }) },
+			"takes int, which is neither built in, provided nor an input struct"},
+		{"duplicate argument", func() {
+			defaultBinder.Bind(func(context.Context, context.Context) error { return nil })
+		}, "takes context.Context twice"},
+		{"two input structs", func() {
+			defaultBinder.Bind(func(OrgOnly, NamePath) error { return nil })
+		}, "takes two input structs"},
+		{"empty input struct", func() { defaultBinder.Bind(noop[struct{}]) },
+			"has no path or query fields and no Body"},
+		{"untagged field", func() { defaultBinder.Bind(noop[struct{ A int }]) },
+			"A has no `path` or `query` tag"},
+		{"untagged field in embedded struct", func() {
 			defaultBinder.Bind(noop[struct {
-				Body struct{} `bind:"header"`
+				Page
+				Q string `query:"q"`
 			}])
-		}, `unknown bind source "header"`},
-		{"optional path", func() {
+		}, "Limit has no `path` or `query` tag"},
+		{"two sources", func() {
 			defaultBinder.Bind(noop[struct {
-				Path *struct{} `bind:"path"`
+				A int `path:"a" query:"a"`
 			}])
-		}, "only the body section may be optional"},
-		{"nil handler", func() { defaultBinder.Bind[OptionalBody](nil) },
-			"nil handler"},
-		{"swapped tag", func() {
-			defaultBinder.Bind(noop[struct {
-				Query struct {
-					A int `json:"a"`
-				} `bind:"query"`
-			}])
-		}, "has no `query` tag"},
-		{"swapped tag in embedded struct", func() {
-			type Page struct {
-				Limit int `json:"limit"`
-			}
-			defaultBinder.Bind(noop[struct {
-				Query struct {
-					Page
-					Q string `query:"q"`
-				} `bind:"query"`
-			}])
-		}, "Limit is in the \"query\" section but has no `query` tag"},
-		{"option in a bind tag", func() {
-			defaultBinder.Bind(noop[struct {
-				Query struct{} `bind:"query,auth"`
-			}])
-		}, `unknown bind source "query,auth"`},
+		}, "has both a `path` and a `query` tag"},
 		{"option in a query tag", func() {
 			defaultBinder.Bind(noop[struct {
-				Query struct {
-					Q string `query:"q,required"`
-				} `bind:"query"`
+				Q string `query:"q,required"`
 			}])
 		}, "the `query` tag must be just a name"},
 		{"unnamed path tag", func() {
 			defaultBinder.Bind(noop[struct {
-				Path struct {
-					ID int `path:""`
-				} `bind:"path"`
+				ID int `path:""`
 			}])
 		}, "the `path` tag must be just a name"},
 		{"nested struct in the query", func() {
 			defaultBinder.Bind(noop[struct {
-				Query struct {
-					Page struct{ N int } `query:"page"`
-				} `bind:"query"`
+				Page struct{ N int } `query:"page"`
 			}])
 		}, "can't be decoded from a query parameter"},
-		{"slice in the path", func() {
+		{"slice in the query", func() {
 			defaultBinder.Bind(noop[struct {
-				Path struct {
-					IDs []int `path:"ids"`
-				} `bind:"path"`
+				IDs []int `query:"id"`
 			}])
-		}, "can't be decoded from a path parameter"},
+		}, "can't be decoded from a query parameter"},
+		{"unexported path field", func() {
+			defaultBinder.Bind(noop[struct {
+				Q  string `query:"q"`
+				id string `path:"id"`
+			}])
+		}, "id is unexported, so its `path` tag is ignored"},
+		{"unexported query field", func() {
+			defaultBinder.Bind(noop[struct {
+				Q string `query:"q"`
+				n int    `query:"n"`
+			}])
+		}, "n is unexported, so its `query` tag is ignored"},
+		{"parameter declared twice", func() {
+			defaultBinder.Bind(noop[struct {
+				ThreeInts
+				Also int `query:"b"`
+			}])
+		}, `two fields for the query parameter "b"`},
+		{"pointer body", func() { defaultBinder.Bind(noop[struct{ Body *Page }]) },
+			"Body is a *binder_test.Page; it must be a struct"},
+		{"slice body", func() { defaultBinder.Bind(noop[struct{ Body []Page }]) },
+			"Body is a []binder_test.Page; it must be a struct"},
+		{"query tag in the body", func() {
+			defaultBinder.Bind(noop[struct {
+				Body struct {
+					A int `query:"a"`
+				}
+			}])
+		}, "Body.A has a `path` or `query` tag but no `json` tag"},
+		{"provide a built-in type", func() {
+			binder.Provide(func(r *http.Request) (*http.Request, error) { return r, nil })
+		}, "Provide(*http.Request): Bind fills it already"},
+		{"provide nil", func() { binder.Provide[*user](nil) }, "Provide(*binder_test.user): nil func"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -1022,6 +876,79 @@ func TestPlanPanics(t *testing.T) {
 			}()
 			tt.bind()
 		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Arguments are filled by type
+// ---------------------------------------------------------------------------
+
+type ctxKey struct{}
+
+func TestInjection(t *testing.T) {
+	type tenant struct{ Name string } // a struct, but provided: not an input
+	me := &user{ID: 7}
+	b := binder.NewBinder(
+		binder.Provide(func(*http.Request) (*user, error) { return me, nil }),
+		binder.Provide(func(*http.Request) (tenant, error) { return tenant{"acme"}, nil }),
+	)
+
+	var called bool
+	r := http.NewServeMux()
+	// Any order; the input struct last but one, to show position doesn't matter.
+	r.HandleFunc("GET /orgs/{org_id}", b.Bind(func(u *user, ctx context.Context, in OrgOnly, req *http.Request, tn tenant) error {
+		called = true
+		if u != me || in.OrgID != 3 || tn.Name != "acme" || req.URL.Path != "/orgs/3" || ctx.Value(ctxKey{}) != "v" {
+			t.Errorf("args = %v %+v %+v %v", u, in, tn, ctx.Value(ctxKey{}))
+		}
+		return nil
+	}))
+
+	req := httptest.NewRequest("GET", "/orgs/3", nil)
+	req = req.WithContext(context.WithValue(req.Context(), ctxKey{}, "v"))
+	wantStatus(t, serve(t, r, req), http.StatusNoContent)
+	if !called {
+		t.Fatal("handler not called")
+	}
+}
+
+func TestProviderRunsOnlyWhenAsked(t *testing.T) {
+	calls := 0
+	b := binder.NewBinder(binder.Provide(func(*http.Request) (*user, error) { calls++; return &user{}, nil }))
+
+	wantStatus(t, serve(t, b.Bind(func() error { return nil }), httptest.NewRequest("GET", "/", nil)), http.StatusNoContent)
+	if calls != 0 {
+		t.Fatalf("provider ran %d times for a handler that doesn't take its type", calls)
+	}
+	wantStatus(t, serve(t, b.Bind(func(*user) error { return nil }), httptest.NewRequest("GET", "/", nil)), http.StatusNoContent)
+	if calls != 1 {
+		t.Fatalf("provider ran %d times, want 1", calls)
+	}
+}
+
+// A provider's error is answered before the input is decoded, through the
+// error mapper, and the handler never runs.
+func TestProviderError(t *testing.T) {
+	errAnon := errors.New("anonymous")
+	b := binder.NewBinder(
+		binder.WithErrorHandler(nil),
+		binder.Provide(func(*http.Request) (*user, error) { return nil, errAnon }),
+		binder.WithErrorMapper(func(err error) error {
+			if errors.Is(err, errAnon) {
+				return binder.Error(http.StatusUnauthorized, "log in", err)
+			}
+			return err
+		}),
+	)
+	h := b.Bind(func(*user, QueryRequired) error {
+		t.Error("handler called")
+		return nil
+	})
+
+	res := serve(t, h, httptest.NewRequest("GET", "/", nil)) // q is missing too
+	wantStatus(t, res, http.StatusUnauthorized)
+	if res.body.Error != "log in" {
+		t.Fatalf("error = %q, want the mapped message", res.body.Error)
 	}
 }
 
@@ -1051,9 +978,7 @@ func TestErrorMapper(t *testing.T) {
 	}
 	for _, tt := range tests {
 		mux := http.NewServeMux()
-		mux.HandleFunc("GET /", b.Bind(func(*OptionalBody, http.ResponseWriter, *http.Request) (any, error) {
-			return nil, tt.err
-		}))
+		mux.HandleFunc("GET /", b.Bind(func() error { return tt.err }))
 		wantStatus(t, serve(t, mux, httptest.NewRequest("GET", "/", nil)), tt.want)
 	}
 }

@@ -16,13 +16,17 @@ import (
 	"strconv"
 )
 
-func decodePath(sec reflect.Value, params []param, r *http.Request) []FieldError {
-	// ServeMux hands wildcards over already unescaped. A name missing from the
-	// route pattern reads as "" and is left alone, so `required` reports it.
+func decodePath(in reflect.Value, params []param, r *http.Request) []FieldError {
+	// ServeMux and chi hand wildcards over already unescaped. A name missing
+	// from the route pattern reads as "" and is left alone, so `required`
+	// reports it.
 	var fails []FieldError
 	for _, p := range params {
+		if p.source != "path" {
+			continue
+		}
 		if val := r.PathValue(p.name); val != "" {
-			if msg := setParam(sec.FieldByIndex(p.index), []string{val}); msg != "" {
+			if msg := setParam(in.FieldByIndex(p.index), []string{val}); msg != "" {
 				fails = append(fails, FieldError{Source: "path", Field: p.name, Message: msg})
 			}
 		}
@@ -30,13 +34,16 @@ func decodePath(sec reflect.Value, params []param, r *http.Request) []FieldError
 	return fails
 }
 
-// decodeQuery rejects parameters the section doesn't declare. Errors are
-// sorted by name, so identical requests produce identical responses.
-func decodeQuery(sec reflect.Value, s section, r *http.Request) []FieldError {
+// decodeQuery rejects parameters the input struct doesn't declare. Errors
+// are sorted by name, so identical requests produce identical responses.
+func decodeQuery(in reflect.Value, params []param, r *http.Request) []FieldError {
 	values := r.URL.Query()
 	var fails []FieldError
-	for _, p := range s.params {
-		if msg := setParam(sec.FieldByIndex(p.index), values[p.name]); msg != "" {
+	for _, p := range params {
+		if p.source != "query" {
+			continue
+		}
+		if msg := setParam(in.FieldByIndex(p.index), values[p.name]); msg != "" {
 			fails = append(fails, FieldError{Source: "query", Field: p.name, Message: msg})
 		}
 		delete(values, p.name)
@@ -52,19 +59,6 @@ func decodeQuery(sec reflect.Value, s section, r *http.Request) []FieldError {
 // the client when they don't fit. An empty value counts as absent, leaving v
 // zero for `required` to report.
 func setParam(v reflect.Value, vals []string) string {
-	if v.Kind() == reflect.Slice {
-		if len(vals) == 0 {
-			return ""
-		}
-		s := reflect.MakeSlice(v.Type(), len(vals), len(vals))
-		for i, val := range vals {
-			if parseValue(s.Index(i), val) != nil {
-				return "is not a valid value"
-			}
-		}
-		v.Set(s)
-		return ""
-	}
 	switch {
 	case len(vals) > 1:
 		return "must not be repeated"
@@ -122,27 +116,15 @@ func parseValue(v reflect.Value, s string) error {
 	return nil
 }
 
-// decodeBody fills the body section. A non-zero status means the request is
+// decodeBody fills the Body field. A non-zero status means the request is
 // refused outright (413, 415) rather than failing field validation.
-func decodeBody(v reflect.Value, s section, w http.ResponseWriter, r *http.Request) ([]FieldError, int) {
-	// Servers always set Body, but hand-built requests may leave it nil.
-	src := r.Body
-	if src == nil {
-		src = http.NoBody
-	}
-	defer func() { _ = src.Close() }()
-	body := bufio.NewReader(http.MaxBytesReader(w, src, maxBodyBytes))
+func decodeBody(v reflect.Value, s *body, w http.ResponseWriter, r *http.Request) ([]FieldError, int) {
+	body := bufio.NewReader(http.MaxBytesReader(w, r.Body, maxBodyBytes))
 
 	// Peek rather than trusting ContentLength, which is -1 for chunked and
 	// many HTTP/2 requests. Emptiness is settled before Content-Type because
 	// clients routinely omit the header when they send nothing.
 	if _, err := body.Peek(1); err != nil {
-		if errors.Is(err, io.EOF) {
-			if s.ptr {
-				return nil, 0 // optional body stays nil, skipping its validation
-			}
-			return []FieldError{{Source: "body", Message: "body is empty"}}, 0
-		}
 		return jsonErrors(err)
 	}
 
@@ -151,20 +133,8 @@ func decodeBody(v reflect.Value, s section, w http.ResponseWriter, r *http.Reque
 			http.StatusUnsupportedMediaType
 	}
 
-	// Pointer sections decode into a fresh value that is only attached on
-	// success, so a whitespace-only body still leaves the section nil.
-	f := v.Field(s.index)
-	dst := f.Addr()
-	if s.ptr {
-		dst = reflect.New(s.typ)
-	}
-
 	dec := jsontext.NewDecoder(body, json.RejectUnknownMembers(true))
-
-	if err := json.UnmarshalDecode(dec, dst.Interface()); err != nil {
-		if s.ptr && errors.Is(err, io.EOF) {
-			return nil, 0
-		}
+	if err := json.UnmarshalDecode(dec, v.Field(s.index).Addr().Interface()); err != nil {
 		return jsonErrors(err)
 	}
 
@@ -175,10 +145,6 @@ func decodeBody(v reflect.Value, s section, w http.ResponseWriter, r *http.Reque
 			return jsonErrors(err)
 		}
 		return []FieldError{{Source: "body", Message: "unexpected data after JSON value"}}, 0
-	}
-
-	if s.ptr {
-		f.Set(dst)
 	}
 	return nil, 0
 }
