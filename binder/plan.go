@@ -48,9 +48,9 @@ type input struct {
 	byPath map[string]param // Go field path ("Page.Limit") -> param, for error attribution
 }
 
-// param is a path or query field: a scalar, a pointer to one or, in the
-// query, a slice of them. Scalars are strings, bools, numbers and types
-// implementing encoding.TextUnmarshaler, such as uuid.UUID and time.Time.
+// param is a path or query field: a scalar or a pointer to one. Scalars are
+// strings, bools, numbers and types implementing encoding.TextUnmarshaler,
+// such as uuid.UUID and time.Time.
 type param struct {
 	source string // "path" or "query"
 	name   string // the wildcard or query parameter name
@@ -58,8 +58,8 @@ type param struct {
 }
 
 type body struct {
-	index int          // field index within the input struct
-	typ   reflect.Type // pointer stripped
+	index int // field index within the input struct
+	typ   reflect.Type
 }
 
 // buildPlan reflects over fn once and panics on anything malformed. Panicking
@@ -116,7 +116,7 @@ func (b *Binder) buildPlan(fn any) *plan {
 
 // buildInput lists the fields of an input struct, flattening embedded structs
 // as encoding/json does, and panics on a field that is neither a tagged
-// parameter nor the Body.
+// parameter nor the Body, and on two parameters with one name.
 func buildInput(t reflect.Type) *input {
 	in := &input{typ: t, byPath: make(map[string]param)}
 	in.params = params(in, t, nil, nil)
@@ -144,6 +144,7 @@ func params(in *input, t reflect.Type, index []int, goPath []string) []param {
 			continue
 		}
 		if !f.IsExported() {
+			// A tagged one would silently stay zero; required can't see it either.
 			if _, ok := f.Tag.Lookup("path"); ok {
 				panic(fmt.Sprintf("binder: %s.%s is unexported, so its `path` tag is ignored", in.typ, f.Name))
 			}
@@ -189,6 +190,8 @@ func params(in *input, t reflect.Type, index []int, goPath []string) []param {
 	return out
 }
 
+// buildBody requires a struct Body, so validation errors always map back to
+// its json names.
 func buildBody(outer reflect.Type, f reflect.StructField) *body {
 	if f.Type.Kind() != reflect.Struct {
 		panic(fmt.Sprintf("binder: %s.Body is a %s; it must be a struct", outer, f.Type))

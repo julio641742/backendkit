@@ -144,9 +144,11 @@ func TestWhere(t *testing.T) {
 	}
 }
 
+// Copies of a Where extend independently: neither loses a condition to the
+// other, and an argument name reused across copies isn't "given twice".
 func TestWhereCopies(t *testing.T) {
 	var base Where
-	for _, c := range []string{"a", "b", "c"} {
+	for _, c := range []string{"a", "b", "c"} { // leaves spare capacity
 		base.And(c+" = @"+c, pgx.NamedArgs{c: 1})
 	}
 	w1, w2 := base, base

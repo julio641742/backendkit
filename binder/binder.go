@@ -39,8 +39,8 @@ type Option func(*Binder)
 //		return nil, binder.Error(http.StatusUnauthorized, "authentication required", nil)
 //	})
 //
-// It panics when T is context.Context, *http.Request or http.ResponseWriter,
-// which Bind fills itself, or fn is nil.
+// It panics when T is context.Context or *http.Request, which Bind fills
+// itself, or fn is nil.
 func Provide[T any](fn func(*http.Request) (T, error)) Option {
 	t := reflect.TypeFor[T]()
 	if reserved(t) {
@@ -125,7 +125,7 @@ func NewBinder(opts ...Option) *Binder {
 // http.ServeMux or chi and composes with standard middleware unchanged. fn's
 // arguments are filled by type, in any order, each type at most once:
 //
-//   - context.Context, *http.Request, http.ResponseWriter: the request's own
+//   - context.Context, *http.Request: the request's own
 //   - a type registered with Provide: what its provider returns
 //   - any other struct: the input struct, decoded from the request
 //
@@ -134,11 +134,6 @@ func NewBinder(opts ...Option) *Binder {
 // picks (see Created). Returning an error routes it through the same JSON
 // envelope used for binding failures, so handlers never hand-roll error
 // responses.
-//
-// Handlers may set response headers on w before returning, such as Location
-// for a Created result; they are sent along with it. Handlers may also write
-// to w themselves, for streaming and the like; once they have, the returned
-// result is ignored.
 //
 // Bind panics when fn's signature breaks these rules; see the package doc for
 // the input struct's.
@@ -212,6 +207,7 @@ func (b *Binder) decode(in *input, w http.ResponseWriter, r *http.Request) (refl
 	// Only validate once decoding succeeded; validating half-populated
 	// structs produces errors that contradict the decode errors.
 	if len(fails) == 0 {
+		// Struct only returns ValidationErrors when given a struct.
 		if ve, ok := errors.AsType[validator.ValidationErrors](b.validate.Struct(v.Interface())); ok {
 			fails = append(fails, in.validationErrors(ve)...)
 		}

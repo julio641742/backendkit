@@ -17,6 +17,7 @@ import (
 	"github.com/julio641742/backendkit/httperr"
 )
 
+// FieldError is one failing input in the error envelope.
 type FieldError = httperr.FieldError
 
 // StatusError lets handlers choose a status without importing the envelope.
@@ -80,8 +81,7 @@ func (b *Binder) handleError(w http.ResponseWriter, r *http.Request, err error) 
 }
 
 // logError logs the handler errors that would otherwise be lost: any that map
-// to a 5xx, any returned after the handler had already started its response,
-// and results that could not be sent.
+// to a 5xx, and results that could not be sent.
 func logError(r *http.Request, err error) {
 	slog.ErrorContext(r.Context(), "binder: handler error",
 		"method", r.Method,

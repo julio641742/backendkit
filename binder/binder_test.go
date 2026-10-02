@@ -355,7 +355,7 @@ func TestQueryErrorsSorted(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Bug 7: handler errors after the response started, and 5xx reporting
+// Bug 7: 5xx reporting
 // ---------------------------------------------------------------------------
 
 func TestHandlerErrorReporting(t *testing.T) {
@@ -494,6 +494,8 @@ func TestMaxBodyBytes(t *testing.T) {
 	wantErrors(t, res, binder.FieldError{Source: "body", Message: "request body too large"})
 }
 
+// The limit reaches the server's own writer, which closes the connection
+// rather than keep reading an oversize upload.
 func TestMaxBodyBytesClosesConnection(t *testing.T) {
 	srv := httptest.NewServer(defaultBinder.Bind(noop[RequiredBody]))
 	defer srv.Close()

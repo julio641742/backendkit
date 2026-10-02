@@ -119,13 +119,14 @@ func parseValue(v reflect.Value, s string) error {
 // decodeBody fills the Body field. A non-zero status means the request is
 // refused outright (413, 415) rather than failing field validation.
 func decodeBody(v reflect.Value, s *body, w http.ResponseWriter, r *http.Request) ([]FieldError, int) {
+	// w must be the server's own writer for the 413 to close the connection.
 	body := bufio.NewReader(http.MaxBytesReader(w, r.Body, maxBodyBytes))
 
 	// Peek rather than trusting ContentLength, which is -1 for chunked and
 	// many HTTP/2 requests. Emptiness is settled before Content-Type because
 	// clients routinely omit the header when they send nothing.
 	if _, err := body.Peek(1); err != nil {
-		return jsonErrors(err)
+		return jsonErrors(err) // io.EOF: "body is empty"
 	}
 
 	if !isJSON(r.Header.Get("Content-Type")) {

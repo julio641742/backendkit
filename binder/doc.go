@@ -17,12 +17,11 @@
 //	mux.HandleFunc("POST /orgs/{org_id}/users", b.Bind(createUser))
 //
 // The input struct is flat. Each field is a path parameter (`path:"name"`),
-// a query parameter (`query:"name"`), or the field named Body, the JSON body;
-// declare it as a pointer to make the body optional. Embedded structs are
-// flattened, so shared parameters can be reused. Parameters are strings,
-// bools, numbers, types implementing encoding.TextUnmarshaler (uuid.UUID,
-// time.Time), pointers to those, and in the query slices of them, read from
-// repeated parameters. Their tag holds only the name; rules such as required
+// a query parameter (`query:"name"`), or the field named Body, the JSON body,
+// which must be a struct. Embedded structs are flattened, so shared parameters
+// can be reused. Parameters are strings, bools, numbers, types implementing
+// encoding.TextUnmarshaler (uuid.UUID, time.Time) and pointers to those, each
+// given at most once. Their tag holds only the name; rules such as required
 // go in the `binding` tag. Unknown query parameters and JSON keys are
 // rejected with a 400. Bodies are capped at 1 MiB.
 //

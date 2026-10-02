@@ -87,7 +87,11 @@ type Where struct {
 // into the conditions around it. Its parameters are named (@name) and given
 // in args. It panics when args reuses a name an earlier condition gave, or
 // one of Select's own (page_limit, page_offset).
+//
+// A copy of a Where can be extended without changing the original, so a
+// shared base filter is safe to build on.
 func (w *Where) And(cond string, args pgx.NamedArgs) {
+	// Copies share the map and the slice's spare capacity; write to our own.
 	w.args = maps.Clone(w.args)
 	if w.args == nil {
 		w.args = pgx.NamedArgs{}
